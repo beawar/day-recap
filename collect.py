@@ -1,22 +1,58 @@
 #!/usr/bin/env python3
-"""Collect today's 08:30-16:00 activity (Claude sessions + GitHub) as compact JSON for /day-recap."""
-import glob, json, os, re, subprocess, sys
+"""Collect today's workday activity (Claude sessions + GitHub) as compact JSON for /day-recap."""
+import glob, json, os, plistlib, re, shutil, subprocess, sys
 from datetime import datetime, time, timedelta
 
 GAP = timedelta(minutes=15)  # idle gap that splits active time
 JIRA = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
 PR_DIR = re.compile(r"-pr-(\d+)$")
 HOME_PREFIX = os.path.expanduser("~").replace("/", "-") + "-"
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "day-recap", "config.json")
+DEFAULTS = {"github_orgs": [], "jira_site": None, "workday": {"start": "08:30", "end": "16:00", "days": [1, 2, 3, 4, 5]},
+            "recaps_dir": "~/recaps", "claude_bin": shutil.which("claude") or "~/.local/bin/claude"}
+
+if not os.path.exists(CONFIG):
+    print(json.dumps({"setup_needed": True, "config_path": CONFIG, "defaults": DEFAULTS}))
+    sys.exit()
+with open(CONFIG) as f:
+    cfg = {**DEFAULTS, **json.load(f)}
+cfg["workday"] = {**DEFAULTS["workday"], **cfg["workday"]}
+cfg["recaps_dir"] = os.path.expanduser(cfg["recaps_dir"])
+cfg["claude_bin"] = os.path.expanduser(cfg["claude_bin"])
+work = cfg["workday"]
+w_start, w_end = (time.fromisoformat(work[k]) for k in ("start", "end"))
+
+
+def plist():
+    """launchd job that runs the recap at the end of each workday."""
+    here = os.path.abspath(__file__)
+    tools = [f"Bash(python3 {here}*)", f"Edit(/{cfg['recaps_dir']}/**)", "mcp__claude_ai_Google_Calendar__list_events",
+             "mcp__claude_ai_Slack__slack_send_message"] + ["mcp__claude_ai_Atlassian__searchJiraIssuesUsingJql"] * bool(cfg["jira_site"])
+    path = [os.path.dirname(cfg["claude_bin"])] + [os.path.dirname(b) for b in [shutil.which("gh")] if b] + ["/usr/bin", "/bin"]
+    log = os.path.join(cfg["recaps_dir"], ".log")
+    return plistlib.dumps({
+        "Label": "local.day-recap",
+        "ProgramArguments": [cfg["claude_bin"], "-p", "/day-recap", "--model", "sonnet", "--allowedTools", " ".join(tools)],
+        "WorkingDirectory": cfg["recaps_dir"],
+        "EnvironmentVariables": {"PATH": ":".join(dict.fromkeys(path))},
+        "StartCalendarInterval": [{"Weekday": d, "Hour": w_end.hour, "Minute": w_end.minute} for d in work["days"]],
+        "StandardOutPath": log, "StandardErrorPath": log,
+    }).decode()
+
+
+if "--plist" in sys.argv:
+    print(plist(), end="")
+    sys.exit()
 
 day = datetime.now().date()
 if len(sys.argv) > 1:  # optional YYYY-MM-DD for testing past days
     day = datetime.strptime(sys.argv[1], "%Y-%m-%d").date()
-start = datetime.combine(day, time(8, 30)).astimezone()
-end = datetime.combine(day, time(16, 0)).astimezone()
+start = datetime.combine(day, w_start).astimezone()
+end = datetime.combine(day, w_end).astimezone()
 errors = []
 
-if day.weekday() >= 5:
-    print(json.dumps({"skip": True, "reason": "weekend"}))
+if day.isoweekday() not in work["days"]:
+    print(json.dumps({"skip": True, "reason": "not a workday"}))
     sys.exit()
 
 
@@ -131,7 +167,8 @@ def gh(*args):
 
 def prs():
     fields = "number,title,repository,state,url,updatedAt"
-    common = ["search", "prs", "--owner", "unobravo", "--updated", f">={day}", "--json", fields, "--limit", "50"]
+    owners = [a for o in cfg["github_orgs"] for a in ("--owner", o)]
+    common = ["search", "prs", *owners, "--updated", f">={day}", "--json", fields, "--limit", "50"]
     mine = gh(*common, "--author", "@me")
     reviewed = gh(*common, "--reviewed-by", "@me")
     me = (gh("api", "user") or {}).get("login")
@@ -153,5 +190,6 @@ def prs():
 
 authored, reviews = prs()
 claude, claude_timeline = sessions()
-print(json.dumps({"date": str(day), "window": "08:30-16:00", "claude": claude, "claude_timeline": claude_timeline,
+print(json.dumps({"date": str(day), "window": f"{work['start']}-{work['end']}",
+                  "config": {k: cfg[k] for k in ("jira_site", "recaps_dir")}, "claude": claude, "claude_timeline": claude_timeline,
                   "authored_prs": authored, "reviews": reviews, "errors": errors}, ensure_ascii=False))

@@ -1,0 +1,7 @@
+{
+  "github_orgs": ["acme"],
+  "jira_site": "acme.atlassian.net",
+  "workday": { "start": "08:30", "end": "16:00", "days": [1, 2, 3, 4, 5] },
+  "recaps_dir": "~/recaps",
+  "claude_bin": "~/.local/bin/claude"
+}
